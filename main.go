@@ -1,65 +1,86 @@
 package main
 
 import (
-	"encoding/json"
+	"context"
 	"flag"
 	"log"
+	"net"
 	"net/http"
+	"os"
+	"os/signal"
+	"syscall"
+	"time"
+
+	"github.com/alexdnn11/http-multiplexer/handlers"
+	"github.com/alexdnn11/http-multiplexer/pool"
 )
 
 const (
-	unsupportedUrlsNumber = "unsupported number of urls"
+	defaultBindAddr = ":8080"
+
+	// defaultMaxConn is the default number of max connections the
+	// server will handle. 0 means no limits will be set, so the
+	// server will be bound by system resources.
+	defaultMaxConn    = 100
+	defaultMaxUrls    = 20
+	defaultReqTimeout = 1
+	defaultMaxWorkers = 4
 )
 
 func main() {
-
 	var (
-		maxWorkers = flag.Int("max_workers", 5, "The number of workers to start")
-		maxClients = flag.Int("max_clients", 100, "The number of clients to handle request concurrently")
-		port       = flag.String("port", "8080", "The server port")
+		bindAddr   string
+		maxConn    uint64
+		maxUrls    uint64
+		reqTimeout uint64
+		maxWorkers uint64
 	)
+
+	flag.StringVar(&bindAddr, "b", defaultBindAddr, "TCP address the server will bind to")
+	flag.Uint64Var(&maxWorkers, "w", defaultMaxWorkers, "The number of workers to start")
+	flag.Uint64Var(&maxConn, "c", defaultMaxConn, "maximum number of client connections the server will accept, 0 means unlimited")
+	flag.Uint64Var(&maxUrls, "u", defaultMaxUrls, "maximum number of urls")
+	flag.Uint64Var(&reqTimeout, "t", defaultReqTimeout, "request timeout in sec")
 	flag.Parse()
 
-	http.HandleFunc("/", limitNumClients(handler, *maxClients))
+	collector := pool.StartDispatcher(int(maxWorkers)) // start up worker pool
 
-	log.Printf("Going to listen on port %s\n", *port)
-	log.Fatal(http.ListenAndServe(":"+*port, nil))
-}
+	multiplex := handlers.NewMultiplexHandler(&collector, int(maxUrls), int(reqTimeout))
+	limiter := handlers.NewLimitHandler(int(maxConn), multiplex)
 
-func handler(w http.ResponseWriter, r *http.Request) {
+	router := http.NewServeMux()
+	router.Handle("/", limiter)
 
-	const maxUrls = 20
-	var (
-		urls []string
-		err  error
-	)
-
-	if r.Method != "POST" {
-		w.Header().Set("Allow", "POST")
-		w.WriteHeader(http.StatusMethodNotAllowed)
-		return
+	srv := http.Server{
+		ReadHeaderTimeout: time.Second * 5,
+		ReadTimeout:       time.Second * 10,
+		Handler:           router,
 	}
 
-	err = json.NewDecoder(r.Body).Decode(&urls)
+	listener, err := net.Listen("tcp", ":8080")
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
-		return
+		log.Fatal(err)
 	}
 
-	if len(urls) > maxUrls {
-		http.Error(w, unsupportedUrlsNumber, http.StatusBadRequest)
-		return
-	}
+	log.Printf("listening on %s\n", listener.Addr().String())
 
-	w.WriteHeader(http.StatusAccepted)
-}
+	go func() {
+		if err := srv.Serve(listener); err != nil && err != http.ErrServerClosed {
+			log.Fatal(err)
+		}
+	}()
 
-func limitNumClients(f http.HandlerFunc, maxClients int) http.HandlerFunc {
-	sema := make(chan struct{}, maxClients)
+	c := make(chan os.Signal, 1)
+	signal.Notify(c, os.Interrupt, syscall.SIGTERM)
+	<-c
 
-	return func(w http.ResponseWriter, req *http.Request) {
-		sema <- struct{}{}
-		defer func() { <-sema }()
-		f(w, req)
+	log.Printf("interrupted, shutting down")
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second*5)
+	defer cancel()
+
+	collector.End <- true
+	if err := srv.Shutdown(ctx); err != nil {
+		log.Printf("graceful shutdown failed: %v\n", err)
 	}
 }
